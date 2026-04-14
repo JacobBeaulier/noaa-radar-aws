@@ -316,18 +316,21 @@ launch_instance() {
     REPO_URL="$REPO_URL" \
     envsubst '${RADAR_BUCKET} ${FORECAST_BUCKET} ${AWS_REGION} ${CLOUDFRONT_RADAR_URL} ${CLOUDFRONT_FORECAST_URL} ${REPO_URL}' \
     < ec2/user-data.sh)"
-  local key_arg=()
-  [[ -n "$KEY_NAME" ]] && key_arg=(--key-name "$KEY_NAME")
+  # Build run-instances args as an array that is always non-empty so that
+  # "${run_args[@]}" is safe under set -u (macOS bash 3.2 treats an empty
+  # array's [@] expansion as unbound).
+  local run_args=(
+    --image-id "$ami" --instance-type "$INSTANCE_TYPE"
+    --security-group-ids "$sg"
+    --iam-instance-profile "Name=$role"
+    --user-data "$user_data"
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-pipeline},{Key=Stack,Value=${STACK_NAME}}]"
+    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=20,VolumeType=gp3}"
+    --query 'Instances[0].InstanceId' --output text
+  )
+  [[ -n "$KEY_NAME" ]] && run_args+=(--key-name "$KEY_NAME")
   local instance_id
-  instance_id="$(aws_ ec2 run-instances \
-    --image-id "$ami" --instance-type "$INSTANCE_TYPE" \
-    --security-group-ids "$sg" \
-    --iam-instance-profile "Name=$role" \
-    "${key_arg[@]}" \
-    --user-data "$user_data" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-pipeline},{Key=Stack,Value=${STACK_NAME}}]" \
-    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=20,VolumeType=gp3}" \
-    --query 'Instances[0].InstanceId' --output text)"
+  instance_id="$(aws_ ec2 run-instances "${run_args[@]}")"
   log "  launched: $instance_id"
   state_set instance_id "$instance_id"
   log "  waiting for instance to enter running state..."
