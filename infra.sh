@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# NOAA MRMS → AWS tile pipeline: infrastructure lifecycle.
+# NOAA MRMS + HRRR → AWS tile pipeline: infrastructure lifecycle.
 #
 # Usage:
 #   ./infra.sh up        # provision S3 + CloudFront + EC2 + pipeline cron
 #   ./infra.sh down      # tear everything down (idempotent)
 #   ./infra.sh status    # show current state of the stack
-#   ./infra.sh logs      # tail pipeline log from the EC2 instance
+#   ./infra.sh logs      # tail pipeline logs from the EC2 instance
+#   ./infra.sh deploy    # pull latest code and restart pipelines on the instance
 #
 # Resources created (all prefixed with $STACK_NAME):
-#   - S3 bucket for tiles, with a 4h lifecycle rule
-#   - CloudFront distribution fronting the bucket (Origin Access Control)
-#   - IAM role + instance profile granting the EC2 instance bucket:PutObject
+#   - Two S3 buckets: radar tiles and forecast tiles
+#   - Two CloudFront distributions (one per bucket, Origin Access Control)
+#   - IAM role + instance profile granting EC2 write access to both buckets
 #   - Security group (SSH-only, optional)
-#   - EC2 instance running cron → MRMS fetch → GDAL → S3 upload
+#   - EC2 instance (Node.js + GDAL) running cron → MRMS (5 min) + HRRR (hourly)
 #
 # State is persisted to .state/ so teardown can reverse exactly what was
 # created. If you lose .state, `down` becomes best-effort against the
@@ -31,10 +32,8 @@ source .env
 
 : "${AWS_REGION:?AWS_REGION must be set}"
 : "${STACK_NAME:?STACK_NAME must be set}"
+: "${REPO_URL:?REPO_URL must be set}"
 : "${INSTANCE_TYPE:=t4g.small}"
-: "${TILE_ZOOM:=2-7}"
-: "${RETENTION_MINUTES:=240}"
-: "${CRON_EVERY_MINUTES:=5}"
 : "${KEY_NAME:=}"
 : "${SSH_CIDR:=0.0.0.0/0}"
 
@@ -53,30 +52,36 @@ state_del() { rm -f "$STATE_DIR/$1"; }
 
 aws_() { aws --region "$AWS_REGION" "$@"; }
 
+# Cache the account ID to avoid repeated STS calls.
+_ACCOUNT_ID=""
+account_id() {
+  if [[ -z "$_ACCOUNT_ID" ]]; then
+    _ACCOUNT_ID="$(aws_ sts get-caller-identity --query Account --output text)"
+  fi
+  echo "$_ACCOUNT_ID"
+}
+
 require_aws() {
   command -v aws >/dev/null || die "aws CLI not installed"
   aws_ sts get-caller-identity >/dev/null \
     || die "aws CLI not authenticated for region $AWS_REGION"
 }
 
-account_id() { aws_ sts get-caller-identity --query Account --output text; }
+# --- S3 bucket names ---------------------------------------------------------
+# Account ID suffix guarantees global uniqueness without coordination.
+
+radar_bucket_name()    { echo "${STACK_NAME}-radar-$(account_id)"; }
+forecast_bucket_name() { echo "${STACK_NAME}-forecast-$(account_id)"; }
 
 # --- resource operations -----------------------------------------------------
 
-# S3 bucket naming rules: lowercase, 3-63 chars, DNS-safe. Account suffix
-# guarantees global uniqueness without coordination.
-bucket_name() {
-  local acct; acct="$(account_id)"
-  echo "${STACK_NAME}-tiles-${acct}"
-}
-
 create_bucket() {
   local bucket="$1"
+  local state_key="$2"   # e.g. "radar_bucket" or "forecast_bucket"
   log "creating S3 bucket: $bucket"
   if aws_ s3api head-bucket --bucket "$bucket" 2>/dev/null; then
     log "  bucket already exists, reusing"
   else
-    # us-east-1 is the only region that rejects a LocationConstraint
     if [[ "$AWS_REGION" == "us-east-1" ]]; then
       aws_ s3api create-bucket --bucket "$bucket" >/dev/null
     else
@@ -88,69 +93,67 @@ create_bucket() {
     --public-access-block-configuration \
     "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false" \
     >/dev/null
-  # Lifecycle: delete tile prefixes older than RETENTION_MINUTES.
-  # Minimum S3 expiration granularity is 1 day, so we apply 1-day expiry
-  # and the pipeline actively prunes anything older than RETENTION_MINUTES
-  # on each run. The lifecycle rule is a safety net for orphans.
-  local life_days=1
+  # Safety-net lifecycle: delete objects older than 7 days.
+  # The pipeline's upload scripts manage their own rotation at a shorter window.
   aws_ s3api put-bucket-lifecycle-configuration --bucket "$bucket" \
-    --lifecycle-configuration "$(cat <<JSON
-{
-  "Rules": [{
-    "ID": "expire-old-tiles",
-    "Status": "Enabled",
-    "Filter": { "Prefix": "" },
-    "Expiration": { "Days": $life_days }
-  }]
-}
-JSON
-)" >/dev/null
-  state_set bucket "$bucket"
+    --lifecycle-configuration '{
+      "Rules": [{
+        "ID": "expire-old-tiles",
+        "Status": "Enabled",
+        "Filter": { "Prefix": "" },
+        "Expiration": { "Days": 7 }
+      }]
+    }' >/dev/null
+  state_set "$state_key" "$bucket"
 }
 
-create_oac() {
-  log "creating CloudFront Origin Access Control"
-  local existing
-  existing="$(aws_ cloudfront list-origin-access-controls \
-    --query "OriginAccessControlList.Items[?Name=='${STACK_NAME}-oac'].Id | [0]" \
+# Provision a CloudFront OAC + distribution for a given S3 bucket.
+# State keys: ${prefix}_oac_id, ${prefix}_dist_id, ${prefix}_dist_domain
+provision_cdn() {
+  local prefix="$1"   # "radar" or "forecast"
+  local bucket="$2"
+  local oac_name="${STACK_NAME}-${prefix}-oac"
+
+  # --- OAC ---
+  log "[$prefix] creating Origin Access Control"
+  local existing_oac
+  existing_oac="$(aws_ cloudfront list-origin-access-controls \
+    --query "OriginAccessControlList.Items[?Name=='${oac_name}'].Id | [0]" \
     --output text 2>/dev/null || true)"
-  if [[ -n "$existing" && "$existing" != "None" ]]; then
-    log "  OAC exists: $existing"
-    state_set oac_id "$existing"
-    return
-  fi
-  local oac_id
-  oac_id="$(aws_ cloudfront create-origin-access-control \
-    --origin-access-control-config "$(cat <<JSON
+  if [[ -n "$existing_oac" && "$existing_oac" != "None" ]]; then
+    log "  OAC exists: $existing_oac"
+    state_set "${prefix}_oac_id" "$existing_oac"
+  else
+    local oac_id
+    oac_id="$(aws_ cloudfront create-origin-access-control \
+      --origin-access-control-config "$(cat <<JSON
 {
-  "Name": "${STACK_NAME}-oac",
-  "Description": "OAC for ${STACK_NAME} tile bucket",
+  "Name": "${oac_name}",
+  "Description": "OAC for ${STACK_NAME} ${prefix} tile bucket",
   "SigningProtocol": "sigv4",
   "SigningBehavior": "always",
   "OriginAccessControlOriginType": "s3"
 }
 JSON
 )" --query 'OriginAccessControl.Id' --output text)"
-  log "  created OAC: $oac_id"
-  state_set oac_id "$oac_id"
-}
-
-create_distribution() {
-  local bucket="$1"
-  local oac_id="$2"
-  log "creating CloudFront distribution (this takes 5-15 min)"
-  local existing
-  existing="$(state_get distribution_id)"
-  if [[ -n "$existing" ]] \
-      && aws_ cloudfront get-distribution --id "$existing" >/dev/null 2>&1; then
-    log "  distribution $existing already exists"
-    return
+    log "  created OAC: $oac_id"
+    state_set "${prefix}_oac_id" "$oac_id"
   fi
-  local config
-  config="$(cat <<JSON
+
+  # --- Distribution ---
+  log "[$prefix] creating CloudFront distribution (5-15 min to deploy)"
+  local existing_dist
+  existing_dist="$(state_get "${prefix}_dist_id")"
+  if [[ -n "$existing_dist" ]] \
+      && aws_ cloudfront get-distribution --id "$existing_dist" >/dev/null 2>&1; then
+    log "  distribution $existing_dist already exists"
+  else
+    local oac_id; oac_id="$(state_get "${prefix}_oac_id")"
+    local out
+    out="$(aws_ cloudfront create-distribution --distribution-config "$(cat <<JSON
 {
-  "CallerReference": "${STACK_NAME}-$(date +%s)",
-  "Comment": "${STACK_NAME} MRMS tile CDN",
+  "CallerReference": "${STACK_NAME}-${prefix}-$(date +%s)",
+  "Comment": "${STACK_NAME} ${prefix} tile CDN",
   "Enabled": true,
   "PriceClass": "PriceClass_100",
   "Origins": {
@@ -175,23 +178,20 @@ create_distribution() {
   }
 }
 JSON
-)"
-  local dist_id dist_domain
-  local out
-  out="$(aws_ cloudfront create-distribution --distribution-config "$config")"
-  dist_id="$(echo "$out" | sed -n 's/.*"Id": "\([^"]*\)".*/\1/p' | head -1)"
-  dist_domain="$(echo "$out" | sed -n 's/.*"DomainName": "\([^"]*\.cloudfront\.net\)".*/\1/p' | head -1)"
-  [[ -n "$dist_id" ]] || die "failed to parse distribution ID"
-  log "  created distribution: $dist_id ($dist_domain)"
-  state_set distribution_id "$dist_id"
-  state_set distribution_domain "$dist_domain"
-}
+)")"
+    local dist_id dist_domain
+    dist_id="$(echo "$out" | sed -n 's/.*"Id": "\([^"]*\)".*/\1/p' | head -1)"
+    dist_domain="$(echo "$out" | sed -n 's/.*"DomainName": "\([^"]*\.cloudfront\.net\)".*/\1/p' | head -1)"
+    [[ -n "$dist_id" ]] || die "failed to parse ${prefix} distribution ID"
+    log "  created distribution: $dist_id ($dist_domain)"
+    state_set "${prefix}_dist_id" "$dist_id"
+    state_set "${prefix}_dist_domain" "$dist_domain"
+  fi
 
-apply_bucket_policy() {
-  local bucket="$1"
-  local dist_id="$2"
+  # --- Bucket policy ---
   local acct; acct="$(account_id)"
-  log "granting CloudFront read access to $bucket"
+  local dist_id; dist_id="$(state_get "${prefix}_dist_id")"
+  log "[$prefix] granting CloudFront read access to $bucket"
   aws_ s3api put-bucket-policy --bucket "$bucket" --policy "$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -213,28 +213,26 @@ JSON
 }
 
 create_iam_role() {
+  local radar_bucket="$1"
+  local forecast_bucket="$2"
   local role="${STACK_NAME}-ec2"
   log "creating IAM role $role"
   if aws_ iam get-role --role-name "$role" >/dev/null 2>&1; then
     log "  role already exists"
   else
     aws_ iam create-role --role-name "$role" \
-      --assume-role-policy-document "$(cat <<JSON
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Service": "ec2.amazonaws.com" },
-    "Action": "sts:AssumeRole"
-  }]
-}
-JSON
-)" >/dev/null
+      --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": { "Service": "ec2.amazonaws.com" },
+          "Action": "sts:AssumeRole"
+        }]
+      }' >/dev/null
   fi
-  # SSM for console access, inline policy for S3 write on our bucket only.
+  # SSM for console access without SSH; tile-writer for both buckets.
   aws_ iam attach-role-policy --role-name "$role" \
     --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null
-  local bucket="$1"
   aws_ iam put-role-policy --role-name "$role" --policy-name tile-writer \
     --policy-document "$(cat <<JSON
 {
@@ -243,18 +241,19 @@ JSON
     "Effect": "Allow",
     "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
     "Resource": [
-      "arn:aws:s3:::${bucket}",
-      "arn:aws:s3:::${bucket}/*"
+      "arn:aws:s3:::${radar_bucket}",
+      "arn:aws:s3:::${radar_bucket}/*",
+      "arn:aws:s3:::${forecast_bucket}",
+      "arn:aws:s3:::${forecast_bucket}/*"
     ]
   }]
 }
 JSON
 )" >/dev/null
-  # Instance profile wraps the role for EC2 consumption.
   if ! aws_ iam get-instance-profile --instance-profile-name "$role" >/dev/null 2>&1; then
     aws_ iam create-instance-profile --instance-profile-name "$role" >/dev/null
     aws_ iam add-role-to-instance-profile --instance-profile-name "$role" --role-name "$role" >/dev/null
-    # IAM is eventually consistent; give EC2 a few seconds to see the profile.
+    # IAM is eventually consistent; give EC2 a moment to see the profile.
     sleep 10
   fi
   state_set iam_role "$role"
@@ -289,7 +288,8 @@ latest_al2023_arm64() {
 }
 
 launch_instance() {
-  local bucket="$1"
+  local radar_bucket="$1"
+  local forecast_bucket="$2"
   local existing
   existing="$(state_get instance_id)"
   if [[ -n "$existing" ]] \
@@ -303,21 +303,19 @@ launch_instance() {
   local ami; ami="$(latest_al2023_arm64)"
   local sg; sg="$(state_get sg_id)"
   local role; role="$(state_get iam_role)"
-  # Render user-data with env substituted. The EC2 instance needs to know
-  # bucket name, zoom range, cron cadence, retention — write them into
-  # /etc/noaa-radar.env and the user-data script reads from there. Restrict
-  # envsubst to our named vars so dollar-signs in shell syntax survive.
+  # Render user-data: substitute bucket names, region, CloudFront domains, and repo URL.
+  local radar_domain forecast_domain
+  radar_domain="$(state_get radar_dist_domain)"
+  forecast_domain="$(state_get forecast_dist_domain)"
   local user_data
-  user_data="$(BUCKET="$bucket" REGION="$AWS_REGION" \
-    TILE_ZOOM="$TILE_ZOOM" RETENTION_MINUTES="$RETENTION_MINUTES" \
-    CRON_EVERY_MINUTES="$CRON_EVERY_MINUTES" \
-    envsubst '${BUCKET} ${REGION} ${TILE_ZOOM} ${RETENTION_MINUTES} ${CRON_EVERY_MINUTES}' \
+  user_data="$(RADAR_BUCKET="$radar_bucket" \
+    FORECAST_BUCKET="$forecast_bucket" \
+    AWS_REGION="$AWS_REGION" \
+    CLOUDFRONT_RADAR_URL="$radar_domain" \
+    CLOUDFRONT_FORECAST_URL="$forecast_domain" \
+    REPO_URL="$REPO_URL" \
+    envsubst '${RADAR_BUCKET} ${FORECAST_BUCKET} ${AWS_REGION} ${CLOUDFRONT_RADAR_URL} ${CLOUDFRONT_FORECAST_URL} ${REPO_URL}' \
     < ec2/user-data.sh)"
-  # Bundle pipeline scripts as a tarball so user-data can drop them into /opt.
-  tar -C pipeline -czf /tmp/pipeline.tar.gz . 2>/dev/null
-  local pipeline_b64; pipeline_b64="$(base64 -w0 /tmp/pipeline.tar.gz)"
-  # Prepend the encoded payload so user-data can recover it.
-  user_data="$(printf '#!/bin/bash\nexport PIPELINE_B64=%q\n%s\n' "$pipeline_b64" "$user_data")"
   local key_arg=()
   [[ -n "$KEY_NAME" ]] && key_arg=(--key-name "$KEY_NAME")
   local instance_id
@@ -328,40 +326,65 @@ launch_instance() {
     "${key_arg[@]}" \
     --user-data "$user_data" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${STACK_NAME}-pipeline},{Key=Stack,Value=${STACK_NAME}}]" \
-    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=12,VolumeType=gp3}" \
+    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=20,VolumeType=gp3}" \
     --query 'Instances[0].InstanceId' --output text)"
   log "  launched: $instance_id"
   state_set instance_id "$instance_id"
   log "  waiting for instance to enter running state..."
   aws_ ec2 wait instance-running --instance-ids "$instance_id"
-  log "  instance running. pipeline bootstrap takes another ~3 min."
+  log "  instance running. bootstrap (git clone + npm install) takes ~5 min."
 }
 
 # --- teardown ----------------------------------------------------------------
 
-down_distribution() {
-  local dist_id; dist_id="$(state_get distribution_id)"
+down_cdn() {
+  local prefix="$1"   # "radar" or "forecast"
+  local dist_id; dist_id="$(state_get "${prefix}_dist_id")"
   [[ -z "$dist_id" ]] && return
-  log "disabling CloudFront distribution $dist_id"
+  log "[$prefix] disabling CloudFront distribution $dist_id"
   local etag
   etag="$(aws_ cloudfront get-distribution-config --id "$dist_id" \
     --query 'ETag' --output text 2>/dev/null || true)"
-  [[ -z "$etag" ]] && { state_del distribution_id; return; }
-  # Fetch config, flip Enabled -> false, push back.
+  [[ -z "$etag" ]] && { state_del "${prefix}_dist_id"; return; }
   aws_ cloudfront get-distribution-config --id "$dist_id" \
-    --query 'DistributionConfig' --output json > /tmp/dist-config.json
-  sed -i 's/"Enabled": true/"Enabled": false/' /tmp/dist-config.json
+    --query 'DistributionConfig' --output json > /tmp/dist-config-${prefix}.json
+  sed -i 's/"Enabled": true/"Enabled": false/' /tmp/dist-config-${prefix}.json
   aws_ cloudfront update-distribution --id "$dist_id" \
-    --distribution-config file:///tmp/dist-config.json \
+    --distribution-config file:///tmp/dist-config-${prefix}.json \
     --if-match "$etag" >/dev/null || warn "update-distribution failed"
-  log "  waiting for distribution to deploy disabled state (15+ min)..."
+  log "  [$prefix] waiting for disabled state to deploy (~15 min)..."
   aws_ cloudfront wait distribution-deployed --id "$dist_id" || warn "wait timed out"
   etag="$(aws_ cloudfront get-distribution-config --id "$dist_id" \
     --query 'ETag' --output text 2>/dev/null || true)"
   aws_ cloudfront delete-distribution --id "$dist_id" --if-match "$etag" \
-    || warn "distribution delete failed; try again after it finishes disabling"
-  state_del distribution_id
-  state_del distribution_domain
+    || warn "distribution delete failed; retry after it finishes disabling"
+  state_del "${prefix}_dist_id"
+  state_del "${prefix}_dist_domain"
+}
+
+down_oac() {
+  local prefix="$1"
+  local id; id="$(state_get "${prefix}_oac_id")"
+  [[ -z "$id" ]] && return
+  log "[$prefix] deleting OAC $id"
+  local etag
+  etag="$(aws_ cloudfront get-origin-access-control --id "$id" \
+    --query 'ETag' --output text 2>/dev/null || true)"
+  [[ -n "$etag" ]] && aws_ cloudfront delete-origin-access-control \
+    --id "$id" --if-match "$etag" 2>/dev/null \
+    || warn "OAC delete failed"
+  state_del "${prefix}_oac_id"
+}
+
+down_bucket() {
+  local state_key="$1"
+  local bucket; bucket="$(state_get "$state_key")"
+  [[ -z "$bucket" ]] && return
+  log "emptying and deleting bucket $bucket"
+  aws_ s3 rm "s3://${bucket}" --recursive >/dev/null 2>&1 || true
+  aws_ s3api delete-bucket --bucket "$bucket" 2>/dev/null \
+    || warn "bucket delete failed (not empty or has policy)"
+  state_del "$state_key"
 }
 
 down_instance() {
@@ -389,32 +412,10 @@ down_iam() {
   aws_ iam remove-role-from-instance-profile --instance-profile-name "$role" --role-name "$role" 2>/dev/null || true
   aws_ iam delete-instance-profile --instance-profile-name "$role" 2>/dev/null || true
   aws_ iam delete-role-policy --role-name "$role" --policy-name tile-writer 2>/dev/null || true
-  aws_ iam detach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
+  aws_ iam detach-role-policy --role-name "$role" \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
   aws_ iam delete-role --role-name "$role" 2>/dev/null || true
   state_del iam_role
-}
-
-down_oac() {
-  local id; id="$(state_get oac_id)"
-  [[ -z "$id" ]] && return
-  log "deleting OAC $id"
-  local etag
-  etag="$(aws_ cloudfront get-origin-access-control --id "$id" \
-    --query 'ETag' --output text 2>/dev/null || true)"
-  [[ -n "$etag" ]] && aws_ cloudfront delete-origin-access-control \
-    --id "$id" --if-match "$etag" 2>/dev/null \
-    || warn "OAC delete failed"
-  state_del oac_id
-}
-
-down_bucket() {
-  local bucket; bucket="$(state_get bucket)"
-  [[ -z "$bucket" ]] && return
-  log "emptying and deleting bucket $bucket"
-  aws_ s3 rm "s3://${bucket}" --recursive >/dev/null 2>&1 || true
-  aws_ s3api delete-bucket --bucket "$bucket" 2>/dev/null \
-    || warn "bucket delete failed (not empty or has policy)"
-  state_del bucket
 }
 
 # --- top-level commands ------------------------------------------------------
@@ -422,76 +423,106 @@ down_bucket() {
 cmd_up() {
   require_aws
   command -v envsubst >/dev/null || die "gettext (envsubst) not installed"
-  local bucket; bucket="$(bucket_name)"
-  create_bucket "$bucket"
-  create_oac
-  create_distribution "$bucket" "$(state_get oac_id)"
-  apply_bucket_policy "$bucket" "$(state_get distribution_id)"
-  create_iam_role "$bucket"
+  local radar_bucket forecast_bucket
+  radar_bucket="$(radar_bucket_name)"
+  forecast_bucket="$(forecast_bucket_name)"
+
+  create_bucket "$radar_bucket"    radar_bucket
+  create_bucket "$forecast_bucket" forecast_bucket
+
+  provision_cdn radar    "$radar_bucket"
+  provision_cdn forecast "$forecast_bucket"
+
+  create_iam_role "$radar_bucket" "$forecast_bucket"
   create_security_group
-  launch_instance "$bucket"
+  launch_instance "$radar_bucket" "$forecast_bucket"
+
   log ""
   log "=== stack up ==="
-  log "bucket:       $bucket"
-  log "distribution: $(state_get distribution_id)"
-  log "tile host:    https://$(state_get distribution_domain)"
+  log "radar bucket:       $radar_bucket"
+  log "forecast bucket:    $forecast_bucket"
+  log "radar CDN:          https://$(state_get radar_dist_domain)"
+  log "forecast CDN:       https://$(state_get forecast_dist_domain)"
   log ""
-  log "Copy the tile host into Raceday-itinerary > Config > Providers > NOAA AWS tile host."
-  log "CloudFront takes another ~10 min to finish deploying. Once status=Deployed,"
-  log "  curl -I https://$(state_get distribution_domain)/"
-  log "should return 403 (access denied is expected for the root, it means routing works)."
+  log "CloudFront takes ~10 min to finish deploying. Paste the CDN URLs into"
+  log "Raceday-itinerary > Config > Providers:"
+  log "  NOAA AWS radar host:    https://$(state_get radar_dist_domain)"
+  log "  NOAA AWS forecast host: https://$(state_get forecast_dist_domain)"
 }
 
 cmd_down() {
   require_aws
-  # CloudFront disable is the slow step; run it first so everything else
-  # can tear down while we wait.
-  down_distribution
+  # Disable both distributions in parallel (slow step), then clean up the rest.
+  down_cdn radar    &
+  down_cdn forecast &
+  wait
   down_instance
   down_sg
   down_iam
-  down_oac
-  down_bucket
+  down_oac radar
+  down_oac forecast
+  down_bucket radar_bucket
+  down_bucket forecast_bucket
   log "teardown complete."
 }
 
 cmd_status() {
   require_aws
-  printf '%-22s %s\n' "bucket"           "$(state_get bucket || echo -)"
-  printf '%-22s %s\n' "distribution_id"  "$(state_get distribution_id || echo -)"
-  printf '%-22s %s\n' "distribution_url" "https://$(state_get distribution_domain || echo -)"
-  printf '%-22s %s\n' "instance_id"      "$(state_get instance_id || echo -)"
-  printf '%-22s %s\n' "iam_role"         "$(state_get iam_role || echo -)"
-  printf '%-22s %s\n' "sg_id"            "$(state_get sg_id || echo -)"
-  printf '%-22s %s\n' "oac_id"           "$(state_get oac_id || echo -)"
+  printf '%-26s %s\n' "radar_bucket"        "$(state_get radar_bucket || echo -)"
+  printf '%-26s %s\n' "forecast_bucket"     "$(state_get forecast_bucket || echo -)"
+  printf '%-26s %s\n' "radar_dist_id"       "$(state_get radar_dist_id || echo -)"
+  printf '%-26s %s\n' "radar_cdn"           "https://$(state_get radar_dist_domain || echo -)"
+  printf '%-26s %s\n' "forecast_dist_id"    "$(state_get forecast_dist_id || echo -)"
+  printf '%-26s %s\n' "forecast_cdn"        "https://$(state_get forecast_dist_domain || echo -)"
+  printf '%-26s %s\n' "instance_id"         "$(state_get instance_id || echo -)"
+  printf '%-26s %s\n' "iam_role"            "$(state_get iam_role || echo -)"
+  printf '%-26s %s\n' "sg_id"               "$(state_get sg_id || echo -)"
+
   local id; id="$(state_get instance_id)"
   if [[ -n "$id" ]]; then
-    printf '%-22s %s\n' "instance_state" \
+    printf '%-26s %s\n' "instance_state" \
       "$(aws_ ec2 describe-instances --instance-ids "$id" \
           --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)"
   fi
-  local dist; dist="$(state_get distribution_id)"
-  if [[ -n "$dist" ]]; then
-    printf '%-22s %s\n' "distribution_state" \
-      "$(aws_ cloudfront get-distribution --id "$dist" \
-          --query 'Distribution.Status' --output text 2>/dev/null || echo unknown)"
-  fi
+  for prefix in radar forecast; do
+    local dist; dist="$(state_get "${prefix}_dist_id")"
+    if [[ -n "$dist" ]]; then
+      printf '%-26s %s\n' "${prefix}_dist_state" \
+        "$(aws_ cloudfront get-distribution --id "$dist" \
+            --query 'Distribution.Status' --output text 2>/dev/null || echo unknown)"
+    fi
+  done
 }
 
 cmd_logs() {
   require_aws
   local id; id="$(state_get instance_id)"
   [[ -z "$id" ]] && die "no instance in state"
-  log "streaming /var/log/noaa-pipeline.log via SSM (Ctrl-C to exit)"
+  local log_file="${1:-mrms}"   # mrms or hrrr
+  log "streaming /var/log/noaa-${log_file}.log via SSM (Ctrl-C to exit)"
   aws_ ssm start-session --target "$id" \
     --document-name AWS-StartInteractiveCommand \
-    --parameters "command=['sudo tail -f /var/log/noaa-pipeline.log']"
+    --parameters "command=['sudo tail -f /var/log/noaa-${log_file}.log']"
+}
+
+cmd_deploy() {
+  require_aws
+  local id; id="$(state_get instance_id)"
+  [[ -z "$id" ]] && die "no instance in state"
+  log "pulling latest code on $id via SSM..."
+  aws_ ssm send-command \
+    --instance-ids "$id" \
+    --document-name "AWS-RunShellScript" \
+    --parameters 'commands=["cd /home/mrms/noaa-radar-pipeline && git pull origin main && npm install && echo deploy-ok"]' \
+    --output text >/dev/null
+  log "deploy command sent. Check logs with: ./infra.sh logs"
 }
 
 case "${1:-}" in
   up)     cmd_up ;;
   down)   cmd_down ;;
   status) cmd_status ;;
-  logs)   cmd_logs ;;
-  *)      echo "usage: $0 {up|down|status|logs}" >&2; exit 2 ;;
+  logs)   cmd_logs "${2:-mrms}" ;;
+  deploy) cmd_deploy ;;
+  *)      echo "usage: $0 {up|down|status|logs [mrms|hrrr]|deploy}" >&2; exit 2 ;;
 esac
