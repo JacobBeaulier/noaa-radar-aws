@@ -1,48 +1,90 @@
 #!/bin/bash
-# user-data: runs as root on first boot of the pipeline EC2.
-# infra.sh expands $BUCKET / $REGION / $TILE_ZOOM / $RETENTION_MINUTES /
-# $CRON_EVERY_MINUTES via envsubst before attaching this to run-instances,
-# then prepends an export of PIPELINE_B64 (the pipeline/ tarball).
+# EC2 bootstrap: install deps, clone pipeline, configure cron.
+#
+# infra.sh renders this file via envsubst before attaching it to run-instances,
+# substituting: ${RADAR_BUCKET} ${FORECAST_BUCKET} ${AWS_REGION}
+#               ${CLOUDFRONT_RADAR_URL} ${CLOUDFRONT_FORECAST_URL} ${REPO_URL}
+#
+# All other ${...} tokens (heredoc contents, etc.) are intentionally left
+# unexpanded by using single-quoted heredoc delimiters.
 set -euxo pipefail
 
 exec > >(tee -a /var/log/noaa-bootstrap.log) 2>&1
 
 dnf -y update
-# Dependencies:
-#   gdal      - gdalwarp, gdal_calc.py, gdaldem, gdal_merge.py, gdal2tiles.py
-#   python3-gdal - the Python GDAL bindings gdal2tiles relies on
-#   eccodes   - GRIB2 decoding backend GDAL uses when the file is compressed
-#   wgrib2    - fallback + sanity-check on raw MRMS files
-#   awscli-2  - we need v2 for sigv4 writes with the instance profile
-#   cronie    - AL2023 doesn't ship cron by default
-dnf -y install gdal gdal-devel python3-gdal eccodes eccodes-devel \
-               wgrib2 awscli cronie jq tar gzip
+# gdal310 / gdal310-python-tools: gdalwarp, gdal_calc.py, gdaldem, gdal_merge.py, gdal2tiles.py
+# nodejs20 + npm: TypeScript pipeline runtime
+# cronie: cron daemon (not installed by default on AL2023)
+# git: clone the repo
+dnf -y install gdal310 gdal310-python-tools nodejs20 npm cronie git
 
 systemctl enable --now crond
 
-# Persist stack config for the pipeline scripts to source at run time.
-cat > /etc/noaa-radar.env <<ENV
-BUCKET=${BUCKET}
-REGION=${REGION}
-TILE_ZOOM=${TILE_ZOOM}
-RETENTION_MINUTES=${RETENTION_MINUTES}
-CRON_EVERY_MINUTES=${CRON_EVERY_MINUTES}
-ENV
+# 512 MB swap — GDAL can spike during raster operations on memory-constrained instances.
+dd if=/dev/zero of=/swapfile bs=1M count=512
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
 
-# Drop pipeline scripts baked into user-data (base64-wrapped tarball).
-install -d -m 755 /opt/noaa-radar
-echo "$PIPELINE_B64" | base64 -d | tar -xzf - -C /opt/noaa-radar
-chmod +x /opt/noaa-radar/*.sh
+# Dedicated user for the pipeline processes.
+useradd -m -s /bin/bash mrms
 
-# Cron: run every N minutes, wall-clock aligned (so we hit just after the
-# MRMS :00/:05/:10 publish boundary). The pipeline self-locks via flock so
-# a slow run can't double up.
-cat > /etc/cron.d/noaa-radar <<CRON
-*/${CRON_EVERY_MINUTES} * * * * root flock -n /var/run/noaa-radar.lock /opt/noaa-radar/run.sh >> /var/log/noaa-pipeline.log 2>&1
+# Log rotation for both pipelines.
+cat > /etc/logrotate.d/noaa-radar << 'EOF'
+/var/log/noaa-mrms.log /var/log/noaa-hrrr.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+}
+EOF
+
+# Clone the pipeline repo.
+git clone ${REPO_URL} /home/mrms/noaa-radar-pipeline
+chown -R mrms:mrms /home/mrms/noaa-radar-pipeline
+
+# Write runtime .env — values are substituted by envsubst in infra.sh.
+cat > /home/mrms/noaa-radar-pipeline/.env << 'DOTENV'
+AWS_REGION=${AWS_REGION}
+S3_RADAR_BUCKET=${RADAR_BUCKET}
+S3_FORECAST_BUCKET=${FORECAST_BUCKET}
+CLOUDFRONT_RADAR_URL=https://${CLOUDFRONT_RADAR_URL}
+CLOUDFRONT_FORECAST_URL=https://${CLOUDFRONT_FORECAST_URL}
+DOTENV
+chmod 600 /home/mrms/noaa-radar-pipeline/.env
+chown mrms:mrms /home/mrms/noaa-radar-pipeline/.env
+
+# Install Node.js dependencies (runs npm postinstall, downloads sharp ARM64 binary).
+cd /home/mrms/noaa-radar-pipeline
+npm install
+chown -R mrms:mrms /home/mrms/noaa-radar-pipeline
+
+# Wrapper scripts with flock to prevent concurrent runs.
+# cron runs as root; su switches to mrms for the actual pipeline work.
+cat > /usr/local/bin/run-mrms.sh << 'SCRIPT'
+#!/bin/bash
+flock -n /var/run/noaa-mrms.lock \
+  su - mrms -c 'cd /home/mrms/noaa-radar-pipeline && npm run mrms' \
+  >> /var/log/noaa-mrms.log 2>&1
+SCRIPT
+chmod +x /usr/local/bin/run-mrms.sh
+
+cat > /usr/local/bin/run-hrrr.sh << 'SCRIPT'
+#!/bin/bash
+flock -n /var/run/noaa-hrrr.lock \
+  su - mrms -c 'cd /home/mrms/noaa-radar-pipeline && npm run hrrr' \
+  >> /var/log/noaa-hrrr.log 2>&1
+SCRIPT
+chmod +x /usr/local/bin/run-hrrr.sh
+
+# Cron: MRMS every 5 minutes (matches NOAA publish cadence), HRRR hourly at :30.
+cat > /etc/cron.d/noaa-radar << 'CRON'
+*/5 * * * * root /usr/local/bin/run-mrms.sh
+30 * * * * root /usr/local/bin/run-hrrr.sh
 CRON
 chmod 644 /etc/cron.d/noaa-radar
 
-# Kick off a first run immediately so the bucket isn't empty when the
-# operator looks at it; failure here doesn't abort bootstrap - cron will
-# retry in a few minutes.
-/opt/noaa-radar/run.sh >> /var/log/noaa-pipeline.log 2>&1 || true
+# Kick off first MRMS run immediately; failure is non-fatal (cron retries in 5 min).
+/usr/local/bin/run-mrms.sh || true
