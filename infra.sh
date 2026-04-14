@@ -502,10 +502,25 @@ cmd_logs() {
   local id; id="$(state_get instance_id)"
   [[ -z "$id" ]] && die "no instance in state"
   local log_file="${1:-mrms}"   # mrms or hrrr
-  log "streaming /var/log/noaa-${log_file}.log via SSM (Ctrl-C to exit)"
-  aws_ ssm start-session --target "$id" \
-    --document-name AWS-StartInteractiveCommand \
-    --parameters "command=['sudo tail -f /var/log/noaa-${log_file}.log']"
+  local lines="${2:-100}"
+  log "fetching last $lines lines of /var/log/noaa-${log_file}.log via SSM..."
+  local cmd_id
+  cmd_id="$(aws_ ssm send-command \
+    --instance-ids "$id" \
+    --document-name "AWS-RunShellScript" \
+    --parameters "commands=[\"tail -n $lines /var/log/noaa-${log_file}.log\"]" \
+    --query 'Command.CommandId' --output text)"
+  # Poll until the command finishes (usually <5 s).
+  local status="InProgress"
+  while [[ "$status" == "InProgress" || "$status" == "Pending" ]]; do
+    sleep 2
+    status="$(aws_ ssm get-command-invocation \
+      --command-id "$cmd_id" --instance-id "$id" \
+      --query 'Status' --output text 2>/dev/null || echo InProgress)"
+  done
+  aws_ ssm get-command-invocation \
+    --command-id "$cmd_id" --instance-id "$id" \
+    --query 'StandardOutputContent' --output text
 }
 
 cmd_deploy() {
